@@ -1,0 +1,361 @@
+#!/usr/bin/env bash
+#
+# faa — a tiny git abstraction for the "verify agent work from one main repo" loop.
+#
+# Topology: one primary ("main") worktree + N linked git worktrees (shared .git),
+# each on its own feature branch. Main can't check out / move a branch that a
+# worktree holds, so for feature branch B it works on a *mirror* branch faa-<B>.
+# Commits flow as fast-forwards between B (owned by the worktree) and faa-<B>
+# (owned by main). See README.md for the full model.
+#
+# Single file, no deps beyond git + the coreutils shipped with Git Bash.
+
+set -uo pipefail
+
+# ---------------------------------------------------------------------------
+# Config (edit here)
+# ---------------------------------------------------------------------------
+# Prefix for the per-feature mirror branches main checks out. Feature branches
+# themselves must NOT start with this prefix. Overridable via the environment.
+FAA_MIRROR_PREFIX="${FAA_MIRROR_PREFIX:-faa-}"
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+info()  { printf '%s\n' "$*"; }
+warn()  { printf 'faa: %s\n' "$*" >&2; }
+die()   { printf 'faa: %s\n' "$*" >&2; exit 1; }
+
+short() { git rev-parse --short "$1" 2>/dev/null; }
+
+# Sanitize a branch name for use inside a ref path (refs/faa/reset/<x>).
+sanitize() { printf '%s' "${1//\//-}"; }
+
+mirror_of()        { printf '%s%s' "$FAA_MIRROR_PREFIX" "$1"; }
+feature_of_mirror(){ printf '%s' "${1#"$FAA_MIRROR_PREFIX"}"; }
+is_mirror()        { case "$1" in "$FAA_MIRROR_PREFIX"*) return 0;; *) return 1;; esac; }
+
+current_branch() { git symbolic-ref --quiet --short HEAD 2>/dev/null; }
+branch_exists()  { git rev-parse --verify --quiet "refs/heads/$1" >/dev/null 2>&1; }
+ref_sha()        { git rev-parse --verify --quiet "$1" 2>/dev/null; }
+is_ancestor()    { git merge-base --is-ancestor "$1" "$2" 2>/dev/null; }
+is_dirty()       { [ -n "$(git status --porcelain)" ]; }
+
+# True when run from the primary worktree ("main"). Both values are git-emitted
+# in the same format (verified stable on Git Bash), so no realpath needed.
+is_main() {
+    local top first
+    top=$(git rev-parse --show-toplevel 2>/dev/null) || return 1
+    first=$(git worktree list --porcelain | sed -n 's/^worktree //p' | head -1)
+    [ "$top" = "$first" ]
+}
+
+# Feature branches that are checked out in *linked* worktrees (skip the primary
+# and any detached/mirror branches).
+linked_branches() {
+    git worktree list --porcelain | awk '
+        /^worktree /{ idx++ }
+        /^branch /{ if (idx > 1) { b=$2; sub(/^refs\/heads\//,"",b); print b } }
+    '
+}
+
+# Same set, ordered by most-recently-updated branch first.
+linked_features_sorted() {
+    local set
+    set=$(linked_branches)
+    [ -n "$set" ] || return 0
+    git for-each-ref --sort=-committerdate --format='%(refname:short)' refs/heads |
+    while IFS= read -r b; do
+        is_mirror "$b" && continue
+        printf '%s\n' "$set" | grep -qxF "$b" && printf '%s\n' "$b"
+    done
+}
+
+worktree_for_branch() {
+    git worktree list --porcelain | awk -v want="refs/heads/$1" '
+        /^worktree /{ wt=$2 }
+        /^branch /{ if ($2 == want) print wt }
+    '
+}
+
+default_feature() { linked_features_sorted | head -1; }
+
+# Commit message: timestamp + a short changed-file summary (run after `git add`).
+auto_msg() {
+    local ts n files
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    n=$(git diff --cached --name-only | wc -l | tr -d '[:space:]')
+    files=$(git diff --cached --name-only | head -5 | paste -sd ', ' -)
+    [ "${n:-0}" -gt 5 ] && files="$files (+$((n - 5)) more)"
+    printf 'faa: %s | %s file(s): %s' "$ts" "$n" "$files"
+}
+
+commit_all() {
+    git add -A
+    git commit -q -m "$(auto_msg)" || die "commit failed"
+}
+
+set_reset_marker() {
+    git update-ref "refs/faa/reset/$(sanitize "$1")" "$2"
+}
+
+# ---------------------------------------------------------------------------
+# Core flows
+# ---------------------------------------------------------------------------
+
+# Worktree: commit the agent's current work onto its feature branch.
+agent_commit() {
+    local feature
+    feature=$(current_branch)
+    is_mirror "$feature" && die "feature branch '$feature' must not start with '$FAA_MIRROR_PREFIX'"
+    if ! is_dirty; then info "nothing to commit."; return 0; fi
+    commit_all
+    info "committed $(short HEAD) on '$feature'."
+}
+
+# Worktree: a main push is pending (mirror is ahead of B). Fast-forward B to the
+# mirror, carrying the agent's uncommitted edits on top.
+agent_pull() {
+    local feature mirror dirty=0
+    feature=$(current_branch)
+    mirror=$(mirror_of "$feature")
+    is_dirty && dirty=1
+    [ "$dirty" -eq 1 ] && git stash push -u -m faa-autostash >/dev/null
+    git merge --ff-only "$mirror" >/dev/null || die "could not fast-forward '$feature' to '$mirror'"
+    if [ "$dirty" -eq 1 ]; then
+        if git stash pop; then
+            info "pulled main's changes into '$feature'; your edits are restored on top — run 'faa' again to commit them."
+        else
+            warn "pulled main's changes, but your edits conflict with them — resolve the markers, then run 'faa'."
+            exit 1
+        fi
+    else
+        info "pulled main's changes into '$feature' ($(short HEAD))."
+    fi
+}
+
+# Main: ensure the mirror for <feature> exists and fast-forward it to B, carrying
+# main's uncommitted edits on top.
+goto_mirror_and_pull() {
+    local feature="$1" mirror b_sha dirty=0 m_sha
+    mirror=$(mirror_of "$feature")
+    b_sha=$(ref_sha "refs/heads/$feature") || die "no such feature branch: $feature"
+    is_dirty && dirty=1
+    [ "$dirty" -eq 1 ] && git stash push -u -m faa-autostash >/dev/null
+    if branch_exists "$mirror"; then
+        [ "$(current_branch)" = "$mirror" ] || git checkout -q "$mirror" || die "could not checkout '$mirror'"
+        m_sha=$(ref_sha "refs/heads/$mirror")
+        if [ "$m_sha" != "$b_sha" ]; then
+            if is_ancestor "refs/heads/$mirror" "refs/heads/$feature"; then
+                git merge --ff-only "$feature" >/dev/null || die "could not fast-forward '$mirror'"
+            elif is_ancestor "refs/heads/$feature" "refs/heads/$mirror"; then
+                : # mirror ahead of B: main has unpushed work, nothing to pull
+            else
+                warn "mirror '$mirror' and '$feature' have diverged; leaving mirror unchanged."
+            fi
+        fi
+    else
+        git checkout -q -b "$mirror" "$feature" || die "could not create mirror '$mirror'"
+    fi
+    if [ "$dirty" -eq 1 ]; then
+        if ! git stash pop; then
+            warn "pulled, but your local edits conflict — resolve the markers, then 'faa push' when ready."
+            exit 1
+        fi
+    fi
+}
+
+# Refuse to switch branches while there's uncommitted work (it belongs to the
+# feature you're leaving, and would otherwise be carried across). A no-op when
+# you're already on the target feature's mirror — there a pull carries it.
+switch_guard() {
+    local feature="$1" target cur
+    target=$(mirror_of "$feature")
+    cur=$(current_branch)
+    [ "$cur" = "$target" ] && return 0          # staying put: pull will carry edits
+    is_dirty || return 0                          # clean: switching is safe
+    if is_mirror "$cur"; then
+        die "uncommitted changes on '$(feature_of_mirror "$cur")' — 'faa push' or stash them before switching to '$feature'."
+    else
+        die "uncommitted changes on '$cur' — commit or stash them before switching to '$feature'."
+    fi
+}
+
+# Main: bare `faa` — follow the newest finished worktree. Pull it if main is
+# already on it, otherwise switch to it.
+main_pull() {
+    local feature mirror
+    feature=$(default_feature)
+    [ -n "$feature" ] || die "no agent worktrees found to verify."
+    switch_guard "$feature"
+    goto_mirror_and_pull "$feature"
+    mirror=$(mirror_of "$feature")
+    info "main mirrors '$feature' as '$mirror' ($(short "refs/heads/$mirror"))."
+}
+
+# Main: commit main's local tweaks onto the mirror so the agent can pull them.
+do_push() {
+    is_main || die "'faa push' is for the main repo (in a worktree, just run 'faa')."
+    local cur feature
+    cur=$(current_branch)
+    is_mirror "$cur" || die "main is not on a faa mirror — run 'faa' or 'faa -c <branch>' first."
+    feature=$(feature_of_mirror "$cur")
+    branch_exists "$feature" || die "feature branch '$feature' no longer exists."
+    if ! is_ancestor "refs/heads/$feature" "refs/heads/$cur"; then
+        die "worktree has new commits on '$feature' — run 'faa' to pull them first."
+    fi
+    if ! is_dirty; then info "nothing to push."; return 0; fi
+    commit_all
+    info "pushed $(short HEAD) on '$cur' — run 'faa' in the worktree to pull."
+}
+
+# Bare `faa`: behavior depends on where it runs.
+bare_faa() {
+    if is_main; then
+        main_pull
+        return
+    fi
+    local feature mirror
+    feature=$(current_branch)
+    [ -n "$feature" ] || die "detached HEAD — checkout your feature branch first."
+    is_mirror "$feature" && die "feature branch '$feature' must not start with '$FAA_MIRROR_PREFIX'."
+    mirror=$(mirror_of "$feature")
+    if branch_exists "$mirror" \
+        && is_ancestor "refs/heads/$feature" "refs/heads/$mirror" \
+        && [ "$(ref_sha "refs/heads/$mirror")" != "$(ref_sha "refs/heads/$feature")" ]; then
+        agent_pull          # mirror is ahead of B → pull main's push
+    else
+        agent_commit        # otherwise → save the agent's work
+    fi
+}
+
+# `faa reset` — declare the current state as truth and record a marker for the
+# other side to adopt with `faa reset sync`.
+do_reset() {
+    local feature ref
+    if is_main; then
+        ref=$(current_branch)
+        is_mirror "$ref" || die "main is not on a faa mirror — run 'faa' or 'faa -c <branch>' first."
+        feature=$(feature_of_mirror "$ref")
+        is_dirty && commit_all
+        set_reset_marker "$feature" "$(ref_sha HEAD)"
+        info "reset marker for '$feature' recorded at $(short HEAD). In the worktree, run 'faa reset sync'."
+    else
+        feature=$(current_branch)
+        [ -n "$feature" ] || die "detached HEAD."
+        is_mirror "$feature" && die "feature branch '$feature' must not start with '$FAA_MIRROR_PREFIX'."
+        is_dirty && commit_all
+        set_reset_marker "$feature" "$(ref_sha HEAD)"
+        info "branch '$feature' reset to $(short HEAD). On main, run 'faa reset sync'."
+    fi
+}
+
+# `faa reset sync` — hard-reset the branch this side owns to the latest marker.
+do_reset_sync() {
+    local feature owned target
+    if is_main; then
+        owned=$(current_branch)
+        is_mirror "$owned" || die "main is not on a faa mirror."
+        feature=$(feature_of_mirror "$owned")
+    else
+        feature=$(current_branch)
+        owned=$feature
+        [ -n "$owned" ] || die "detached HEAD."
+    fi
+    target=$(ref_sha "refs/faa/reset/$(sanitize "$feature")") \
+        || die "no reset marker for '$feature' — run 'faa reset' on the other side first."
+    git reset --hard "$target" >/dev/null || die "reset failed."
+    info "'$owned' hard-reset to $(short "$target") (prior tip kept in reflog)."
+}
+
+# ---------------------------------------------------------------------------
+# Listing / picking / checkout
+# ---------------------------------------------------------------------------
+print_feature_line() {
+    local i="$1" f="$2" mirror state wt
+    mirror=$(mirror_of "$f")
+    if branch_exists "$mirror"; then state="$mirror"; else state="(no mirror yet)"; fi
+    wt=$(worktree_for_branch "$f")
+    printf '%2d) %-22s  mirror: %-24s  %s\n' "$i" "$f" "$state" "$wt"
+}
+
+list_worktrees() {
+    local n="${1:-5}" i=0 any=0 f
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        i=$((i + 1)); any=1
+        print_feature_line "$i" "$f"
+    done < <(linked_features_sorted | head -n "$n")
+    [ "$any" -eq 1 ] || info "no agent worktrees in work."
+}
+
+checkout_feature() {
+    is_main || die "'faa -c' is for the main repo."
+    local feature="$1"
+    is_mirror "$feature" && feature=$(feature_of_mirror "$feature")
+    branch_exists "$feature" || die "no such feature branch: $feature"
+    switch_guard "$feature"
+    goto_mirror_and_pull "$feature"
+    info "main now mirrors '$feature' as '$(mirror_of "$feature")'."
+}
+
+pick_worktree() {
+    is_main || die "'faa -p' is for the main repo."
+    local n="${1:-5}" i=0 choice f
+    local -a feats=()
+    while IFS= read -r f; do [ -n "$f" ] && feats+=("$f"); done < <(linked_features_sorted | head -n "$n")
+    [ "${#feats[@]}" -gt 0 ] || die "no agent worktrees in work."
+    for f in "${feats[@]}"; do i=$((i + 1)); print_feature_line "$i" "$f"; done
+    printf 'Pick a number: '
+    IFS= read -r choice || die "no selection."
+    case "$choice" in
+        ''|*[!0-9]*) die "not a number: $choice";;
+    esac
+    [ "$choice" -ge 1 ] && [ "$choice" -le "${#feats[@]}" ] || die "out of range: $choice"
+    checkout_feature "${feats[$((choice - 1))]}"
+}
+
+usage() {
+    cat <<EOF
+faa — manage the worktree <-> main verify loop (no raw git needed)
+
+USAGE
+  faa                 In a worktree: save your work (commit), OR if main pushed,
+                      pull that first (then run 'faa' again to save your edits).
+                      In main: pull the latest work for the feature you verify.
+  faa push            In main: commit your local tweaks so the agent can pull them.
+  faa reset           Declare the current state as truth; tell the other side to sync.
+  faa reset sync      Adopt the other side's latest reset (hard reset — discards
+                      local changes on this side).
+
+  faa -l, --list [N]      List the last N worktrees in work (default 5).
+  faa -p, --pick [N]      List the last N and pick one to verify (main).
+  faa -c, --checkout B    Verify feature branch B in main (creates mirror ${FAA_MIRROR_PREFIX}B).
+  faa -h, --help          Show this help.
+
+Mirror prefix: ${FAA_MIRROR_PREFIX} (set FAA_MIRROR_PREFIX to change).
+Feature branches must not start with that prefix.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+main() {
+    git rev-parse --git-dir >/dev/null 2>&1 || die "not a git repository."
+    case "${1:-}" in
+        '')               bare_faa ;;
+        push)             do_push ;;
+        reset)
+            if [ "${2:-}" = "sync" ]; then do_reset_sync
+            elif [ -z "${2:-}" ];     then do_reset
+            else die "unknown: faa reset ${2}"; fi ;;
+        -l|--list)        list_worktrees "${2:-5}" ;;
+        -p|--pick)        pick_worktree "${2:-5}" ;;
+        -c|--checkout)    [ -n "${2:-}" ] || die "usage: faa -c <branch>"; checkout_feature "$2" ;;
+        -h|--help)        usage ;;
+        *)                die "unknown command: $1 (try 'faa -h')." ;;
+    esac
+}
+
+main "$@"
