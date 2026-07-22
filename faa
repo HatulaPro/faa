@@ -271,29 +271,51 @@ do_reset_sync() {
 # ---------------------------------------------------------------------------
 # faa loop — run the same command in N throwaway worktrees
 # ---------------------------------------------------------------------------
-# Each run gets a fresh detached worktree at the current commit and runs your
-# command in it; faa doesn't care what the command is (an agent, a chain of
-# agents, a plain script). Each run's stdout is saved as summary-<ts>/run-N.md,
-# so whatever the command prints is the run's summary — route anything you
-# don't want in it to stderr. Worktrees are removed afterwards unless --keep.
+# Each run gets a detached worktree at the current commit and runs your command
+# in it; faa doesn't care what the command is (an agent, a chain of agents, a
+# plain script). Each run's stdout is saved as summary-<ts>/run-N.md, so
+# whatever the command prints is the run's summary — route anything you don't
+# want in it to stderr.
+#
+# By default the worktrees are a persistent, reused pool (.faa-loop-pool/wt-N):
+# reset --hard + clean -fdx is cheaper than a fresh checkout since only what
+# differs gets rewritten, and it leaves each run's work in place to inspect
+# until the next loop. N can change freely between runs — extra slots are
+# created on demand, fewer-than-before slots just sit unused. --no-reuse goes
+# back to throwaway worktrees, created fresh under the summary dir and removed
+# after. Only meant for one `faa loop` at a time against a given pool —
+# concurrent loops should each pass --no-reuse.
+ensure_pool_worktree() {
+    local wt="$1" sha="$2"
+    if git -C "$wt" rev-parse --git-dir >/dev/null 2>&1; then
+        if git -C "$wt" clean -fdx -q >/dev/null 2>&1 \
+            && git -C "$wt" reset --hard -q "$sha" >/dev/null 2>&1; then
+            return 0
+        fi
+        git worktree remove --force "$wt" >/dev/null 2>&1
+    fi
+    rm -rf "$wt"
+    git worktree add -q -d "$wt" "$sha" || die "could not create worktree $wt"
+}
+
 do_loop() {
     is_main || die "'faa loop' is for the main repo."
-    local n=5 seq=0 keep=0
+    local n=5 seq=0 reuse=1
     local -a cmd=()
     while [ $# -gt 0 ]; do
         case "$1" in
-            -n)     [ -n "${2:-}" ] || die "faa loop: -n needs a number"; n="$2"; shift 2 ;;
-            --seq)  seq=1; shift ;;
-            --keep) keep=1; shift ;;
-            --)     shift; cmd=("$@"); break ;;
-            *)      die "unknown: faa loop $1 (try 'faa -h')" ;;
+            -n)          [ -n "${2:-}" ] || die "faa loop: -n needs a number"; n="$2"; shift 2 ;;
+            --seq)       seq=1; shift ;;
+            --no-reuse)  reuse=0; shift ;;
+            --)          shift; cmd=("$@"); break ;;
+            *)           die "unknown: faa loop $1 (try 'faa -h')" ;;
         esac
     done
     case "$n" in ''|*[!0-9]*) die "faa loop: -n must be a number, got '$n'";; esac
     [ "$n" -ge 1 ] || die "faa loop: -n must be at least 1"
     [ "${#cmd[@]}" -gt 0 ] || die "faa loop: no command — end the options with '-- <cmd> [args...]'"
 
-    local sha root out id
+    local sha root out id excl
     sha=$(git rev-parse --verify --quiet 'HEAD^{commit}') || die "no commit to run from."
     root=$(git rev-parse --show-toplevel)
     id="summary-$(date +%Y%m%d-%H%M%S)"
@@ -303,22 +325,33 @@ do_loop() {
     id="${out##*/}"
     mkdir -p "$out"
 
-    # Keep summary dirs out of git status without touching tracked files.
-    local excl
+    # Keep faa's own dirs out of git status without touching tracked files.
     excl="$(git rev-parse --git-common-dir)/info/exclude"
     grep -qxF 'summary-*/' "$excl" 2>/dev/null || printf 'summary-*/\n' >> "$excl"
+    grep -qxF '.faa-loop-pool/' "$excl" 2>/dev/null || printf '.faa-loop-pool/\n' >> "$excl"
 
-    info "faa loop: $n run(s) from $(short "$sha") -> $id/"
+    git worktree prune >/dev/null 2>&1
 
-    # Worktrees are created serially (git worktree metadata isn't race-safe),
-    # then the runs themselves go in parallel unless --seq. stdin is /dev/null
-    # so a command that waits for input fails fast instead of hanging.
-    local i
+    local i wtdir
+    if [ "$reuse" -eq 1 ]; then
+        wtdir="$root/.faa-loop-pool"
+        mkdir -p "$wtdir"
+        info "faa loop: $n run(s) from $(short "$sha") -> $id/ (reusing $wtdir)"
+        for i in $(seq 1 "$n"); do
+            ensure_pool_worktree "$wtdir/wt-$i" "$sha"
+        done
+    else
+        wtdir="$out"
+        info "faa loop: $n run(s) from $(short "$sha") -> $id/"
+        for i in $(seq 1 "$n"); do
+            git worktree add -q -d "$wtdir/wt-$i" "$sha" || die "could not create worktree wt-$i"
+        done
+    fi
+
+    # Runs go in parallel unless --seq. stdin is /dev/null so a command that
+    # waits for input fails fast instead of hanging.
     for i in $(seq 1 "$n"); do
-        git worktree add -q -d "$out/wt-$i" "$sha" || die "could not create worktree wt-$i"
-    done
-    for i in $(seq 1 "$n"); do
-        ( cd "$out/wt-$i" && "${cmd[@]}"; printf '%s\n' "$?" > "$out/.rc-$i" ) \
+        ( cd "$wtdir/wt-$i" && "${cmd[@]}"; printf '%s\n' "$?" > "$out/.rc-$i" ) \
             </dev/null >"$out/run-$i.md" &
         [ "$seq" -eq 1 ] && wait
     done
@@ -332,7 +365,7 @@ do_loop() {
         else
             warn "run $i exited with ${rc:-?}  (run-$i.md)"
         fi
-        [ "$keep" -eq 1 ] || git worktree remove --force "$out/wt-$i" >/dev/null 2>&1
+        [ "$reuse" -eq 0 ] && git worktree remove --force "$wtdir/wt-$i" >/dev/null 2>&1
     done
     git worktree prune >/dev/null 2>&1
     info "summaries: $id/"
@@ -399,12 +432,13 @@ USAGE
                       local changes on this side).
 
   faa loop [opts] -- CMD [ARGS...]
-                      In main: run CMD in N throwaway worktrees at the current
-                      commit. Each run's stdout is saved as run-N.md in a fresh
+                      In main: run CMD in N worktrees at the current commit.
+                      Each run's stdout is saved as run-N.md in a fresh
                       summary-<timestamp>/ dir (stderr passes through to you).
       -n N            number of runs (default 5)
       --seq           run one at a time (default: all in parallel)
-      --keep          keep the worktrees for inspection
+      --no-reuse      use fresh throwaway worktrees instead of the persistent
+                      pool (.faa-loop-pool/), removed once the run is done
 
   faa -l, --list [N]      List the last N worktrees in work (default 5).
   faa -p, --pick [N]      List the last N and pick one to verify (main).

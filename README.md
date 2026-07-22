@@ -54,7 +54,7 @@ and every sync is a fast-forward (faa never has to merge committed history).
 | `faa push`                 | main       | Commit your local tweaks onto the mirror so the agent can pull them. Aborts if the worktree has advanced — run `faa` to pull first.                                                                                                        |
 | `faa reset`                | either     | "I'm done / scratch all this": declare the current state as truth, then run `faa reset sync` on the other side.                                                                                                                            |
 | `faa reset sync`           | other side | Adopt the latest reset (a hard reset — discards local changes here; the old tip stays in the reflog).                                                                                                                                      |
-| `faa loop ... -- CMD`      | main       | Run CMD in N throwaway worktrees at the current commit; each run's stdout is saved as `summary-<ts>/run-N.md`. See [faa loop](#faa-loop--fan-out-throwaway-runs).                                                                          |
+| `faa loop ... -- CMD`      | main       | Run CMD in N worktrees at the current commit; each run's stdout is saved as `summary-<ts>/run-N.md`. See [faa loop](#faa-loop--fan-out-parallel-runs).                                                                                    |
 | `faa -l`, `--list [N]`     | any        | List the last N worktrees in work (default 5).                                                                                                                                                                                             |
 | `faa -p`, `--pick [N]`     | main       | List the last N and pick one (by number) to verify.                                                                                                                                                                                        |
 | `faa -c`, `--checkout <B>` | main       | Verify feature branch `B` (creates/updates mirror `faa-B`).                                                                                                                                                                                |
@@ -75,14 +75,14 @@ faa push            # send your fix back
 faa                 # agent pulls your fix and keeps going
 ```
 
-## faa loop — fan out throwaway runs
+## faa loop — fan out parallel runs
 
 The verify loop above is for work you keep. `faa loop` is the opposite: run the
-same command in N disposable worktrees at the current commit, and keep only
-what each run *printed*.
+same command in N disposable worktrees at the current commit, and keep what
+each run *printed*.
 
 ```bash
-faa loop [-n N] [--seq] [--keep] -- CMD [ARGS...]
+faa loop [-n N] [--seq] [--no-reuse] -- CMD [ARGS...]
 ```
 
 `CMD` runs inside each worktree — faa doesn't know or care what it is: an
@@ -103,11 +103,27 @@ faa loop -n 5 -- sh -c '
     opencode run "Summarize the changes in this repo as markdown"'
 ```
 
-| Flag     | What it does                                                                                                                        |
-| -------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `-n N`   | Number of runs (default 5).                                                                                                          |
-| `--seq`  | Run one at a time (default is all in parallel; same total tokens either way — parallel only buys wall-clock, so go `--seq` if your provider rate-limits). |
-| `--keep` | Keep the worktrees (as `wt-N/` inside the summary dir) instead of removing them. `git worktree remove` them when done.               |
+| Flag         | What it does                                                                                                                        |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `-n N`       | Number of runs (default 5).                                                                                                          |
+| `--seq`      | Run one at a time (default is all in parallel; same total tokens either way — parallel only buys wall-clock, so go `--seq` if your provider rate-limits). |
+| `--no-reuse` | Use fresh throwaway worktrees under the summary dir, removed once the run is done, instead of the reused pool.                       |
+
+### Worktree reuse
+
+By default the worktrees are a **persistent pool** at `.faa-loop-pool/wt-N`.
+Each loop resets the slots it needs (`git clean -fdx` + `git reset --hard`)
+rather than creating worktrees from scratch — cheaper, because git only
+rewrites what actually differs instead of materializing the whole tree N times.
+
+Two useful consequences: `N` can change freely between runs (extra slots are
+created on demand, and shrinking just leaves the unused ones alone), and each
+run's *work* stays on disk in its slot until the next loop reclaims it — so if
+a summary makes you want the actual diff, it's still there in
+`.faa-loop-pool/wt-N`.
+
+The pool assumes one `faa loop` at a time. If you need two loops running
+concurrently, pass `--no-reuse` so they don't reset each other's worktrees.
 
 The worktrees are detached, so they never collide with the mirror-branch
 machinery above and don't show up in `faa -l`. Runs start from whatever commit

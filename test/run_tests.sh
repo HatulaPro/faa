@@ -369,17 +369,18 @@ journey_master_picks_latest() {
 }
 
 # --------------------------------------------------------------------------
-# Journey 10 — faa loop: run the same command in N throwaway worktrees at the
-# current commit; each run's stdout becomes summary-<ts>/run-N.md. The
-# "agent" here is a plain shell command chain; faa doesn't care what it is.
+# Journey 10 — faa loop: run the same command in N worktrees at the current
+# commit; each run's stdout becomes summary-<ts>/run-N.md. The "agent" here
+# is a plain shell command chain; faa doesn't care what it is. Default mode
+# reuses a persistent pool (.faa-loop-pool/); --no-reuse is the throwaway path.
 # --------------------------------------------------------------------------
 journey_loop() {
-    echo "Journey 10: faa loop fans out throwaway runs"
+    echo "Journey 10: faa loop fans out runs"
     setup
 
     # Two runs of a fake two-stage agent: stage one does the work (its chatter
     # goes to stderr), stage two prints the markdown summary — only stdout
-    # lands in the summary file.
+    # lands in the summary file. Default mode: reused pool.
     cd "$MAIN"
     faa loop -n 2 -- sh -c 'echo "working..." >&2; echo "code" > out.js && echo "## summary: $(cat out.js)"'
     assert_ok  "loop runs to completion"
@@ -394,18 +395,41 @@ journey_loop() {
     else
         pass "stderr stays out of the summary"
     fi
-    assert_nofile  "$RUN" wt-1 "worktrees are thrown away after the runs"
+    assert_file "$MAIN" .faa-loop-pool/wt-1/out.js code "reused pool worktree kept its work"
+    assert_file "$MAIN" .faa-loop-pool/wt-2/out.js code "second pool worktree kept its work"
 
-    # Summary dirs are excluded from git status, so main stays clean.
+    # faa's own dirs are excluded from git status, so main stays clean.
     [ -z "$(git -C "$MAIN" status --porcelain)" ] \
-        && pass "main stays clean (summary-*/ is git-excluded)" \
-        || fail "main stays clean (summary-*/ is git-excluded)"
+        && pass "main stays clean (summary-*/ and pool are git-excluded)" \
+        || fail "main stays clean (summary-*/ and pool are git-excluded)"
 
-    # --keep leaves the worktrees around, work included.
-    faa loop -n 1 --keep -- sh -c 'echo "code" > out.js; echo done'
-    assert_ok "loop with --keep"
+    # A second run reuses wt-1/wt-2: stale output from the first run must be
+    # gone (clean -fdx) and a fresh commit picked up (reset --hard).
+    printf 'v2\n' > extra.txt
+    git -C "$MAIN" add -A && git -C "$MAIN" commit -q -m "add extra"
+    faa loop -n 2 -- sh -c 'test -f extra.txt && echo has-v2; test -f out.js && echo stale || echo clean'
+    assert_ok      "second loop run reuses the pool"
+    assert_filehas "$(ls -dt "$MAIN"/summary-*/ | head -1)" run-1.md "has-v2" "reused worktree picked up the new commit"
+    assert_filehas "$(ls -dt "$MAIN"/summary-*/ | head -1)" run-1.md "clean" "reused worktree was cleaned of stale files"
+
+    # N growing beyond the pool size creates the extra slot on demand.
+    faa loop -n 3 -- sh -c 'echo grown'
+    assert_ok "loop grows the pool when N increases"
+    assert_filehas "$(ls -dt "$MAIN"/summary-*/ | head -1)" run-3.md "grown" "third run executed"
+    [ -d "$MAIN/.faa-loop-pool/wt-3" ] && pass "pool has a 3rd worktree after N=3" || fail "pool has a 3rd worktree after N=3"
+
+    # N shrinking back just leaves the extra slot unused, untouched.
+    faa loop -n 1 -- sh -c 'echo shrink'
+    assert_ok "loop shrinks back without complaint"
+    [ -d "$MAIN/.faa-loop-pool/wt-3" ] && pass "unused pool slot is left alone, not deleted" \
+        || fail "unused pool slot is left alone, not deleted"
+
+    # --no-reuse: fresh throwaway worktrees, removed once the run is done.
+    faa loop -n 1 --no-reuse -- sh -c 'echo "code" > out.js; echo done'
+    assert_ok "loop --no-reuse runs"
     RUN=$(ls -dt "$MAIN"/summary-*/ | head -1)
-    assert_file "$RUN" wt-1/out.js code "worktree kept with its work"
+    assert_filehas "$RUN" run-1.md "done" "--no-reuse run still writes its summary"
+    assert_nofile  "$RUN" wt-1 "--no-reuse worktree is thrown away after the run"
 
     # A failing run is reported but doesn't kill the loop.
     faa loop -n 1 -- sh -c 'echo partial; exit 3'
