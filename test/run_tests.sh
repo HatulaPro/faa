@@ -369,6 +369,57 @@ journey_master_picks_latest() {
 }
 
 # --------------------------------------------------------------------------
+# Journey 10 — faa loop: run the same command in N throwaway worktrees at the
+# current commit; each run's stdout becomes summary-<ts>/run-N.md. The
+# "agent" here is a plain shell command chain; faa doesn't care what it is.
+# --------------------------------------------------------------------------
+journey_loop() {
+    echo "Journey 10: faa loop fans out throwaway runs"
+    setup
+
+    # Two runs of a fake two-stage agent: stage one does the work (its chatter
+    # goes to stderr), stage two prints the markdown summary — only stdout
+    # lands in the summary file.
+    cd "$MAIN"
+    faa loop -n 2 -- sh -c 'echo "working..." >&2; echo "code" > out.js && echo "## summary: $(cat out.js)"'
+    assert_ok  "loop runs to completion"
+    assert_out "2 run(s)" "reports the fan-out"
+
+    local RUN
+    RUN=$(ls -d "$MAIN"/summary-*/ | head -1)
+    assert_filehas "$RUN" run-1.md "## summary: code" "run 1's stdout saved as markdown"
+    assert_filehas "$RUN" run-2.md "## summary: code" "run 2's stdout saved as markdown"
+    if grep -qF "working..." "$RUN/run-1.md" 2>/dev/null; then
+        fail "stderr stays out of the summary"
+    else
+        pass "stderr stays out of the summary"
+    fi
+    assert_nofile  "$RUN" wt-1 "worktrees are thrown away after the runs"
+
+    # Summary dirs are excluded from git status, so main stays clean.
+    [ -z "$(git -C "$MAIN" status --porcelain)" ] \
+        && pass "main stays clean (summary-*/ is git-excluded)" \
+        || fail "main stays clean (summary-*/ is git-excluded)"
+
+    # --keep leaves the worktrees around, work included.
+    faa loop -n 1 --keep -- sh -c 'echo "code" > out.js; echo done'
+    assert_ok "loop with --keep"
+    RUN=$(ls -dt "$MAIN"/summary-*/ | head -1)
+    assert_file "$RUN" wt-1/out.js code "worktree kept with its work"
+
+    # A failing run is reported but doesn't kill the loop.
+    faa loop -n 1 -- sh -c 'echo partial; exit 3'
+    assert_ok  "loop survives a failing run"
+    assert_out "exited with 3" "the failure is reported"
+
+    # Guard rail: loop needs a command.
+    faa loop -n 1
+    assert_fails "loop without a command refuses"
+
+    cleanup
+}
+
+# --------------------------------------------------------------------------
 journey_core_loop
 journey_main_tweaks_agent_file
 journey_push_guard
@@ -378,6 +429,7 @@ journey_multi_agent
 journey_conflict
 journey_two_features
 journey_master_picks_latest
+journey_loop
 
 echo
 echo "-----------------------------------------"

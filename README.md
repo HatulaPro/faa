@@ -54,6 +54,7 @@ and every sync is a fast-forward (faa never has to merge committed history).
 | `faa push`                 | main       | Commit your local tweaks onto the mirror so the agent can pull them. Aborts if the worktree has advanced — run `faa` to pull first.                                                                                                        |
 | `faa reset`                | either     | "I'm done / scratch all this": declare the current state as truth, then run `faa reset sync` on the other side.                                                                                                                            |
 | `faa reset sync`           | other side | Adopt the latest reset (a hard reset — discards local changes here; the old tip stays in the reflog).                                                                                                                                      |
+| `faa loop ... -- CMD`      | main       | Run CMD in N throwaway worktrees at the current commit; each run's stdout is saved as `summary-<ts>/run-N.md`. See [faa loop](#faa-loop--fan-out-throwaway-runs).                                                                          |
 | `faa -l`, `--list [N]`     | any        | List the last N worktrees in work (default 5).                                                                                                                                                                                             |
 | `faa -p`, `--pick [N]`     | main       | List the last N and pick one (by number) to verify.                                                                                                                                                                                        |
 | `faa -c`, `--checkout <B>` | main       | Verify feature branch `B` (creates/updates mirror `faa-B`).                                                                                                                                                                                |
@@ -73,6 +74,44 @@ faa push            # send your fix back
 # in the worktree
 faa                 # agent pulls your fix and keeps going
 ```
+
+## faa loop — fan out throwaway runs
+
+The verify loop above is for work you keep. `faa loop` is the opposite: run the
+same command in N disposable worktrees at the current commit, and keep only
+what each run *printed*.
+
+```bash
+faa loop [-n N] [--seq] [--keep] -- CMD [ARGS...]
+```
+
+`CMD` runs inside each worktree — faa doesn't know or care what it is: an
+agent, a chain of agents, a plain script. The contract is just streams:
+
+- **stdout** becomes the run's summary, saved as `summary-<timestamp>/run-N.md`
+  in the main repo (the dir is auto-added to `.git/info/exclude`, so git
+  status stays clean).
+- **stderr** passes through to your terminal and is not saved.
+
+Since agent CLIs like `opencode run` are synchronous, multi-stage runs are
+plain `&&` chains — no support from faa needed. Route the working stages'
+output to stderr so only the last stage's markdown lands in the summary:
+
+```bash
+faa loop -n 5 -- sh -c '
+    opencode run "Implement streaming for X" >&2 &&
+    opencode run "Summarize the changes in this repo as markdown"'
+```
+
+| Flag     | What it does                                                                                                                        |
+| -------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `-n N`   | Number of runs (default 5).                                                                                                          |
+| `--seq`  | Run one at a time (default is all in parallel; same total tokens either way — parallel only buys wall-clock, so go `--seq` if your provider rate-limits). |
+| `--keep` | Keep the worktrees (as `wt-N/` inside the summary dir) instead of removing them. `git worktree remove` them when done.               |
+
+The worktrees are detached, so they never collide with the mirror-branch
+machinery above and don't show up in `faa -l`. Runs start from whatever commit
+main is currently on — to fan out from somewhere else, check that out first.
 
 ## Install
 

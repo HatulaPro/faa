@@ -269,6 +269,76 @@ do_reset_sync() {
 }
 
 # ---------------------------------------------------------------------------
+# faa loop — run the same command in N throwaway worktrees
+# ---------------------------------------------------------------------------
+# Each run gets a fresh detached worktree at the current commit and runs your
+# command in it; faa doesn't care what the command is (an agent, a chain of
+# agents, a plain script). Each run's stdout is saved as summary-<ts>/run-N.md,
+# so whatever the command prints is the run's summary — route anything you
+# don't want in it to stderr. Worktrees are removed afterwards unless --keep.
+do_loop() {
+    is_main || die "'faa loop' is for the main repo."
+    local n=5 seq=0 keep=0
+    local -a cmd=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -n)     [ -n "${2:-}" ] || die "faa loop: -n needs a number"; n="$2"; shift 2 ;;
+            --seq)  seq=1; shift ;;
+            --keep) keep=1; shift ;;
+            --)     shift; cmd=("$@"); break ;;
+            *)      die "unknown: faa loop $1 (try 'faa -h')" ;;
+        esac
+    done
+    case "$n" in ''|*[!0-9]*) die "faa loop: -n must be a number, got '$n'";; esac
+    [ "$n" -ge 1 ] || die "faa loop: -n must be at least 1"
+    [ "${#cmd[@]}" -gt 0 ] || die "faa loop: no command — end the options with '-- <cmd> [args...]'"
+
+    local sha root out id
+    sha=$(git rev-parse --verify --quiet 'HEAD^{commit}') || die "no commit to run from."
+    root=$(git rev-parse --show-toplevel)
+    id="summary-$(date +%Y%m%d-%H%M%S)"
+    out="$root/$id"
+    local k=1
+    while [ -e "$out" ]; do out="$root/$id-$k"; k=$((k + 1)); done
+    id="${out##*/}"
+    mkdir -p "$out"
+
+    # Keep summary dirs out of git status without touching tracked files.
+    local excl
+    excl="$(git rev-parse --git-common-dir)/info/exclude"
+    grep -qxF 'summary-*/' "$excl" 2>/dev/null || printf 'summary-*/\n' >> "$excl"
+
+    info "faa loop: $n run(s) from $(short "$sha") -> $id/"
+
+    # Worktrees are created serially (git worktree metadata isn't race-safe),
+    # then the runs themselves go in parallel unless --seq. stdin is /dev/null
+    # so a command that waits for input fails fast instead of hanging.
+    local i
+    for i in $(seq 1 "$n"); do
+        git worktree add -q -d "$out/wt-$i" "$sha" || die "could not create worktree wt-$i"
+    done
+    for i in $(seq 1 "$n"); do
+        ( cd "$out/wt-$i" && "${cmd[@]}"; printf '%s\n' "$?" > "$out/.rc-$i" ) \
+            </dev/null >"$out/run-$i.md" &
+        [ "$seq" -eq 1 ] && wait
+    done
+    wait
+
+    local rc
+    for i in $(seq 1 "$n"); do
+        rc=$(cat "$out/.rc-$i" 2>/dev/null); rm -f "$out/.rc-$i"
+        if [ "${rc:-1}" -eq 0 ] 2>/dev/null; then
+            info "  run $i: ok  (run-$i.md)"
+        else
+            warn "run $i exited with ${rc:-?}  (run-$i.md)"
+        fi
+        [ "$keep" -eq 1 ] || git worktree remove --force "$out/wt-$i" >/dev/null 2>&1
+    done
+    git worktree prune >/dev/null 2>&1
+    info "summaries: $id/"
+}
+
+# ---------------------------------------------------------------------------
 # Listing / picking / checkout
 # ---------------------------------------------------------------------------
 print_feature_line() {
@@ -328,6 +398,14 @@ USAGE
   faa reset sync      Adopt the other side's latest reset (hard reset — discards
                       local changes on this side).
 
+  faa loop [opts] -- CMD [ARGS...]
+                      In main: run CMD in N throwaway worktrees at the current
+                      commit. Each run's stdout is saved as run-N.md in a fresh
+                      summary-<timestamp>/ dir (stderr passes through to you).
+      -n N            number of runs (default 5)
+      --seq           run one at a time (default: all in parallel)
+      --keep          keep the worktrees for inspection
+
   faa -l, --list [N]      List the last N worktrees in work (default 5).
   faa -p, --pick [N]      List the last N and pick one to verify (main).
   faa -c, --checkout B    Verify feature branch B in main (creates mirror ${FAA_MIRROR_PREFIX}B).
@@ -346,6 +424,7 @@ main() {
     case "${1:-}" in
         '')               bare_faa ;;
         push)             do_push ;;
+        loop)             shift; do_loop "$@" ;;
         reset)
             if [ "${2:-}" = "sync" ]; then do_reset_sync
             elif [ -z "${2:-}" ];     then do_reset
