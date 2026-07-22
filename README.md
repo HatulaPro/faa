@@ -55,6 +55,7 @@ and every sync is a fast-forward (faa never has to merge committed history).
 | `faa reset`                | either     | "I'm done / scratch all this": declare the current state as truth, then run `faa reset sync` on the other side.                                                                                                                            |
 | `faa reset sync`           | other side | Adopt the latest reset (a hard reset — discards local changes here; the old tip stays in the reflog).                                                                                                                                      |
 | `faa loop ... -- CMD`      | main       | Run CMD in N worktrees at the current commit; each run's stdout is saved as `summary-<ts>/run-N.md`. See [faa loop](#faa-loop--fan-out-parallel-runs).                                                                                    |
+| `faa loop --clean`         | main       | Remove the reused worktree pool, discarding the work still in it.                                                                                                                                                                        |
 | `faa -l`, `--list [N]`     | any        | List the last N worktrees in work (default 5).                                                                                                                                                                                             |
 | `faa -p`, `--pick [N]`     | main       | List the last N and pick one (by number) to verify.                                                                                                                                                                                        |
 | `faa -c`, `--checkout <B>` | main       | Verify feature branch `B` (creates/updates mirror `faa-B`).                                                                                                                                                                                |
@@ -121,6 +122,16 @@ created on demand, and shrinking just leaves the unused ones alone), and each
 run's *work* stays on disk in its slot until the next loop reclaims it — so if
 a summary makes you want the actual diff, it's still there in
 `.faa-loop-pool/wt-N`.
+
+When you're done with a batch, tear the pool down:
+
+```bash
+faa loop --clean
+```
+
+That removes `.faa-loop-pool/` and everything still in it — including the last
+loop's work — so grab any diff you care about first. The next `faa loop`
+rebuilds the pool from scratch.
 
 The pool assumes one `faa loop` at a time. If you need two loops running
 concurrently, pass `--no-reuse` so they don't reset each other's worktrees.

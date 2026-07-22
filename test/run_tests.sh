@@ -436,9 +436,32 @@ journey_loop() {
     assert_ok  "loop survives a failing run"
     assert_out "exited with 3" "the failure is reported"
 
-    # Guard rail: loop needs a command.
+    # --clean tears the pool down, discarding the work still in it.
+    [ -d "$MAIN/.faa-loop-pool" ] && pass "pool exists before --clean" \
+        || fail "pool exists before --clean"
+    faa loop --clean
+    assert_ok      "loop --clean runs"
+    assert_out     "removed 3 pool worktree(s)" "reports what it removed"
+    assert_nofile  "$MAIN" .faa-loop-pool "the pool is gone"
+    [ -z "$(git -C "$MAIN" worktree list --porcelain | grep -F '.faa-loop-pool')" ] \
+        && pass "no pool worktrees left registered with git" \
+        || fail "no pool worktrees left registered with git"
+
+    # --clean on an already-clean repo is a no-op, not an error.
+    faa loop --clean
+    assert_ok  "loop --clean with no pool is a no-op"
+    assert_out "no worktree pool" "says there was nothing to clean"
+
+    # The next loop rebuilds the pool from scratch.
+    faa loop -n 1 -- sh -c 'echo rebuilt'
+    assert_ok      "loop rebuilds the pool after --clean"
+    assert_filehas "$(ls -dt "$MAIN"/summary-*/ | head -1)" run-1.md "rebuilt" "run works on the rebuilt pool"
+
+    # Guard rails: loop needs a command, and --clean stands alone.
     faa loop -n 1
     assert_fails "loop without a command refuses"
+    faa loop --clean -n 2
+    assert_fails "--clean with other arguments refuses"
 
     cleanup
 }

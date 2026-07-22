@@ -285,6 +285,25 @@ do_reset_sync() {
 # back to throwaway worktrees, created fresh under the summary dir and removed
 # after. Only meant for one `faa loop` at a time against a given pool —
 # concurrent loops should each pass --no-reuse.
+# `faa loop --clean` — tear the pool down. Each run's work lives in its slot
+# until the next loop reclaims it, so this discards whatever is still there.
+clean_pool() {
+    is_main || die "'faa loop --clean' is for the main repo."
+    local root pool wt n=0
+    root=$(git rev-parse --show-toplevel)
+    pool="$root/.faa-loop-pool"
+    [ -d "$pool" ] || { info "no worktree pool to clean."; return 0; }
+    for wt in "$pool"/wt-*; do
+        [ -e "$wt" ] || continue
+        git worktree remove --force "$wt" >/dev/null 2>&1
+        rm -rf "$wt"
+        n=$((n + 1))
+    done
+    rm -rf "$pool"
+    git worktree prune >/dev/null 2>&1
+    info "removed $n pool worktree(s) (.faa-loop-pool)."
+}
+
 ensure_pool_worktree() {
     local wt="$1" sha="$2"
     if git -C "$wt" rev-parse --git-dir >/dev/null 2>&1; then
@@ -307,6 +326,7 @@ do_loop() {
             -n)          [ -n "${2:-}" ] || die "faa loop: -n needs a number"; n="$2"; shift 2 ;;
             --seq)       seq=1; shift ;;
             --no-reuse)  reuse=0; shift ;;
+            --clean)     shift; [ $# -eq 0 ] || die "faa loop: --clean takes no other arguments"; clean_pool; return ;;
             --)          shift; cmd=("$@"); break ;;
             *)           die "unknown: faa loop $1 (try 'faa -h')" ;;
         esac
@@ -439,6 +459,8 @@ USAGE
       --seq           run one at a time (default: all in parallel)
       --no-reuse      use fresh throwaway worktrees instead of the persistent
                       pool (.faa-loop-pool/), removed once the run is done
+  faa loop --clean    In main: remove the worktree pool, discarding the work
+                      still sitting in it from the last loop.
 
   faa -l, --list [N]      List the last N worktrees in work (default 5).
   faa -p, --pick [N]      List the last N and pick one to verify (main).
