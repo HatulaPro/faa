@@ -144,8 +144,8 @@ main is currently on — to fan out from somewhere else, check that out first.
 
 ## Install
 
-`faa` is one file with no dependencies beyond git and the coreutils that ship
-with **Git Bash**. Put it on your `PATH`:
+`faa` is one file with no dependencies beyond git (2.31+) and the coreutils
+that ship with **Git Bash**. Put it on your `PATH`:
 
 ```bash
 cp faa /usr/bin/faa        # or any dir on PATH
@@ -153,6 +153,14 @@ chmod +x /usr/bin/faa
 ```
 
 Then run `faa` from main or from any worktree.
+
+On a big repo, most of faa's remaining time is git scanning your files. git's
+file-system monitor and untracked cache cut that down (run once per repo):
+
+```bash
+git config core.fsmonitor true
+git config core.untrackedCache true
+```
 
 ## Configuration
 

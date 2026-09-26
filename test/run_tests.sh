@@ -548,6 +548,75 @@ journey_both() {
 }
 
 # --------------------------------------------------------------------------
+# Journey 12 — pulls that need care: edits in the same file as incoming
+# changes, switching back to a mirror that fell behind, a mirror main has
+# pushed ahead, and a mirror that diverged.
+# --------------------------------------------------------------------------
+journey_careful_pulls() {
+    echo "Journey 12: pulls that need care"
+    setup
+    add_wt add-button; local A="$WT"
+    add_wt fix-nav;    local B="$WT"
+
+    cd "$A"; printf 'L1\nL2\nL3\nL4\nL5\n' > a.js; faa
+    cd "$MAIN"; faa -c add-button
+
+    # Main edits line 1 while the agent changes line 5 of the same file: the
+    # pull keeps main's edit and brings in the agent's.
+    cd "$A"; printf 'L1\nL2\nL3\nL4\nAGENT\n' > a.js; faa
+    cd "$MAIN"; printf 'MAIN\nL2\nL3\nL4\nL5\n' > a.js
+    faa -c add-button
+    assert_ok   "main pulls into a file it's editing"
+    assert_file "$MAIN" a.js $'MAIN\nL2\nL3\nL4\nAGENT' "both edits are in the file"
+    faa push; assert_ok "main pushes its edit"
+
+    # Same the other way: the agent edits a file main pushes to.
+    cd "$A"; faa                                  # pull main's edit
+    printf 'MAIN\nL2\nWT\nL4\nAGENT\n' > a.js
+    printf 'X\nL2\nL3\nL4\nAGENT\n' > "$MAIN/a.js"
+    ( cd "$MAIN" && command faa push >/dev/null 2>&1 )
+    faa
+    assert_ok   "agent pulls into a file it's editing"
+    assert_out  "run 'faa' again" "agent is told its edits are on top"
+    assert_file "$A" a.js $'X\nL2\nWT\nL4\nAGENT' "both edits are in the agent's file"
+    faa; assert_ok "agent commits the merged file"
+
+    # Main is on another feature while add-button moves on; switching back
+    # fast-forwards the mirror as part of the checkout.
+    cd "$B"; printf 'nav\n' > nav.js; faa
+    cd "$MAIN"; faa -c fix-nav
+    cd "$A"; printf 'new\n' > new.js; faa
+    cd "$MAIN"; faa -c add-button
+    assert_ok        "switch back to a mirror that fell behind"
+    assert_curbranch "$MAIN" faa-add-button "main is on add-button's mirror"
+    assert_same      "$MAIN" refs/heads/faa-add-button refs/heads/add-button "the mirror caught up"
+    assert_file      "$MAIN" new.js new "main has the agent's latest"
+
+    # Main pushed and the agent hasn't pulled: main's faa has nothing to pull
+    # and reports the mirror's own tip.
+    printf 'fix\n' > fix.js; faa push
+    local tip; tip=$(git -C "$MAIN" rev-parse --short HEAD)
+    faa -c add-button
+    assert_ok  "faa with main's push still pending"
+    assert_same "$MAIN" HEAD refs/heads/faa-add-button "main stays on its push"
+    faa
+    assert_out "($tip)" "reports the mirror's tip, not the older feature"
+
+    # The two diverge (someone committed on the mirror by hand): faa warns and
+    # leaves the mirror alone.
+    cd "$A"; faa                                  # pull main's push
+    printf 'more\n' > more.js; faa
+    git -C "$MAIN" commit -q --allow-empty -m "by hand"
+    local mtip; mtip=$(sha "$MAIN" HEAD)
+    cd "$MAIN"; faa -c add-button
+    assert_ok   "faa on a diverged mirror doesn't fail"
+    assert_out  "diverged" "warns that they diverged"
+    assert_same "$MAIN" HEAD "$mtip" "the mirror is left alone"
+
+    cleanup
+}
+
+# --------------------------------------------------------------------------
 # Journey — customizing faa through git config. The repo's .git/config is
 # shared by main and every worktree, so both sides agree on the prefixes.
 # --------------------------------------------------------------------------
@@ -615,6 +684,7 @@ journey_two_features
 journey_master_picks_latest
 journey_loop
 journey_both
+journey_careful_pulls
 
 echo
 echo "-----------------------------------------"
