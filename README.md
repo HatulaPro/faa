@@ -154,12 +154,32 @@ chmod +x /usr/bin/faa
 
 Then run `faa` from main or from any worktree.
 
+## Configuration
+
+faa reads its settings from git config, so you never have to edit the script
+(and can update it by just copying the new version over). Set them with
+`--global` for all your repos, or without it for just the current one — a repo's
+setting wins over the global one, and main and all its worktrees share it.
+
+| Key                      | Default  | What it does                                                                    |
+| ------------------------ | -------- | ------------------------------------------------------------------------------- |
+| `faa.mirrorBranchPrefix` | `faa-`   | Prefix of the mirror branches main works on. Must be non-empty.                 |
+| `faa.commitPrefix`       | `faa: `  | Prefix of auto-generated commit messages. Set it to `""` for no prefix at all. |
+
+```bash
+git config --global faa.mirrorBranchPrefix mirror/
+git config --global faa.commitPrefix ""
+```
+
+Change `faa.mirrorBranchPrefix` when no mirrors are in use: existing mirrors
+keep their old names, and faa won't recognize them as mirrors anymore.
+
 ## Notes
 
 - **Topology:** worktrees of one repo (shared `.git`) created with
   `git worktree add`. No remotes/fetch involved — everything is local refs.
-- **Mirror prefix:** `faa-` by default. Change it at the top of the script
-  (`FAA_MIRROR_PREFIX`) or via the environment (`FAA_MIRROR_PREFIX=mir- faa`).
+- **Mirror prefix:** `faa-` by default. Change it with
+  `git config faa.mirrorBranchPrefix <prefix>` (see [Configuration](#configuration)).
 - **One rule:** feature branches must not start with the mirror prefix (they'd be
   mistaken for mirrors). faa errors out if they do.
 - **Multiple features at once:** each gets its own mirror, so plain `faa` on main

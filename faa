@@ -13,27 +13,52 @@
 set -uo pipefail
 
 # ---------------------------------------------------------------------------
-# Config (edit here)
-# ---------------------------------------------------------------------------
-# Prefix for the per-feature mirror branches main checks out. Feature branches
-# themselves must NOT start with this prefix. Overridable via the environment.
-FAA_MIRROR_PREFIX="${FAA_MIRROR_PREFIX:-faa-}"
-
-# ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
 info()  { printf '%s\n' "$*"; }
 warn()  { printf 'faa: %s\n' "$*" >&2; }
 die()   { printf 'faa: %s\n' "$*" >&2; exit 1; }
 
+# ---------------------------------------------------------------------------
+# Config — read from git config, so a repo's .git/config overrides ~/.gitconfig:
+#   faa.mirrorBranchPrefix  prefix for the per-feature mirror branches main
+#                           checks out (default "faa-"). Feature branches must
+#                           NOT start with it.
+#   faa.commitPrefix        prefix for auto-generated commit messages
+#                           (default "faa: "; may be empty).
+# ---------------------------------------------------------------------------
+MIRROR_PREFIX=faa-
+COMMIT_PREFIX='faa: '
+
+# Print git config <key>, or <default> when it's unset. Any other failure (e.g.
+# a malformed config file) is fatal rather than silently using the default.
+config_get() { # <key> <default>
+    local v rc
+    v=$(git config --get "$1"); rc=$?
+    case "$rc" in
+        0) printf '%s' "$v" ;;
+        1) printf '%s' "$2" ;;
+        *) die "couldn't read git config $1." ;;
+    esac
+}
+
+load_config() {
+    MIRROR_PREFIX=$(config_get faa.mirrorBranchPrefix faa-) || exit 1
+    COMMIT_PREFIX=$(config_get faa.commitPrefix 'faa: ') || exit 1
+    # An empty prefix would make every branch look like a mirror.
+    [ -n "$MIRROR_PREFIX" ] || die "faa.mirrorBranchPrefix must not be empty."
+    git check-ref-format --branch "${MIRROR_PREFIX}x" >/dev/null 2>&1 \
+        || die "faa.mirrorBranchPrefix '$MIRROR_PREFIX' isn't valid in a branch name."
+}
+
 short() { git rev-parse --short "$1" 2>/dev/null; }
 
 # Sanitize a branch name for use inside a ref path (refs/faa/reset/<x>).
 sanitize() { printf '%s' "${1//\//-}"; }
 
-mirror_of()        { printf '%s%s' "$FAA_MIRROR_PREFIX" "$1"; }
-feature_of_mirror(){ printf '%s' "${1#"$FAA_MIRROR_PREFIX"}"; }
-is_mirror()        { case "$1" in "$FAA_MIRROR_PREFIX"*) return 0;; *) return 1;; esac; }
+mirror_of()        { printf '%s%s' "$MIRROR_PREFIX" "$1"; }
+feature_of_mirror(){ printf '%s' "${1#"$MIRROR_PREFIX"}"; }
+is_mirror()        { case "$1" in "$MIRROR_PREFIX"*) return 0;; *) return 1;; esac; }
 
 current_branch() { git symbolic-ref --quiet --short HEAD 2>/dev/null; }
 branch_exists()  { git rev-parse --verify --quiet "refs/heads/$1" >/dev/null 2>&1; }
@@ -100,7 +125,7 @@ auto_msg() {
     n=$(git diff --cached --name-only | wc -l | tr -d '[:space:]')
     files=$(git diff --cached --name-only | head -5 | awk 'NR > 1 { printf ", " } { printf "%s", $0 }')
     [ "${n:-0}" -gt 5 ] && files="$files (+$((n - 5)) more)"
-    printf 'faa: %s | %s file(s): %s' "$ts" "$n" "$files"
+    printf '%s%s | %s file(s): %s' "$COMMIT_PREFIX" "$ts" "$n" "$files"
 }
 
 commit_all() {
@@ -129,7 +154,7 @@ set_reset_marker() {
 agent_commit() {
     local feature
     feature=$(current_branch)
-    is_mirror "$feature" && die "feature branch '$feature' must not start with '$FAA_MIRROR_PREFIX'"
+    is_mirror "$feature" && die "feature branch '$feature' must not start with '$MIRROR_PREFIX'"
     if ! is_dirty; then info "nothing to commit."; return 0; fi
     commit_all
     info "committed $(short HEAD) on '$feature'."
@@ -242,7 +267,7 @@ bare_faa() {
     local feature
     feature=$(current_branch)
     [ -n "$feature" ] || die "detached HEAD — checkout your feature branch first."
-    is_mirror "$feature" && die "feature branch '$feature' must not start with '$FAA_MIRROR_PREFIX'."
+    is_mirror "$feature" && die "feature branch '$feature' must not start with '$MIRROR_PREFIX'."
     if mirror_ahead "$feature"; then
         agent_pull          # mirror is ahead of B → pull main's push
     else
@@ -269,7 +294,7 @@ both_save() {
     local feature main
     feature=$(current_branch)
     [ -n "$feature" ] || die "detached HEAD — checkout your feature branch first."
-    is_mirror "$feature" && die "feature branch '$feature' must not start with '$FAA_MIRROR_PREFIX'."
+    is_mirror "$feature" && die "feature branch '$feature' must not start with '$MIRROR_PREFIX'."
     main=$(main_dir) || exit 1    # before touching anything, so a bad setup fails early
     if mirror_ahead "$feature"; then
         agent_pull
@@ -312,7 +337,7 @@ do_reset() {
     else
         feature=$(current_branch)
         [ -n "$feature" ] || die "detached HEAD."
-        is_mirror "$feature" && die "feature branch '$feature' must not start with '$FAA_MIRROR_PREFIX'."
+        is_mirror "$feature" && die "feature branch '$feature' must not start with '$MIRROR_PREFIX'."
         is_dirty && commit_all
         set_reset_marker "$feature" "$(ref_sha HEAD)"
         info "branch '$feature' reset to $(short HEAD). On main, run 'faa reset sync'."
@@ -537,10 +562,10 @@ USAGE
 
   faa -l, --list [N]      List the last N worktrees in work (default 5).
   faa -p, --pick [N]      List the last N and pick one to verify (main).
-  faa -c, --checkout B    Verify feature branch B in main (creates mirror ${FAA_MIRROR_PREFIX}B).
+  faa -c, --checkout B    Verify feature branch B in main (creates mirror ${MIRROR_PREFIX}B).
   faa -h, --help          Show this help.
 
-Mirror prefix: ${FAA_MIRROR_PREFIX} (set FAA_MIRROR_PREFIX to change).
+Mirror prefix: ${MIRROR_PREFIX} (git config faa.mirrorBranchPrefix to change).
 Feature branches must not start with that prefix.
 EOF
 }
@@ -550,6 +575,7 @@ EOF
 # ---------------------------------------------------------------------------
 main() {
     git rev-parse --git-dir >/dev/null 2>&1 || die "not a git repository."
+    load_config
     case "${1:-}" in
         '')               bare_faa ;;
         push)             do_push ;;

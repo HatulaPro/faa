@@ -12,6 +12,10 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PATH="$SCRIPT_DIR:$PATH"
 
+# Ignore the user's own ~/.gitconfig and system config (e.g. a personal
+# faa.mirrorBranchPrefix), so every run starts from faa's defaults.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+
 PASS=0
 FAIL=0
 LAST_OUT=""

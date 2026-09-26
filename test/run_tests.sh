@@ -548,6 +548,62 @@ journey_both() {
 }
 
 # --------------------------------------------------------------------------
+# Journey — customizing faa through git config. The repo's .git/config is
+# shared by main and every worktree, so both sides agree on the prefixes.
+# --------------------------------------------------------------------------
+journey_config() {
+    echo "Journey: git config"
+    setup; add_wt add-button
+
+    # Defaults: "faa: " commit messages, "faa-" mirrors.
+    cd "$WT"; printf 'v1\n' > feature.js; faa
+    case "$(git log -1 --format=%s)" in
+        "faa: "*) pass "default commit prefix is 'faa: '" ;;
+        *)        fail "default commit prefix is 'faa: '" "subject: $(git log -1 --format=%s)" ;;
+    esac
+
+    # Custom prefixes, set once in the repo.
+    git -C "$MAIN" config faa.mirrorBranchPrefix mir/
+    git -C "$MAIN" config faa.commitPrefix ''
+    printf 'v2\n' > feature.js; faa
+    assert_ok "agent commits with custom config"
+    case "$(git log -1 --format=%s)" in
+        [0-9][0-9][0-9][0-9]-*) pass "empty commit prefix: message starts with the timestamp" ;;
+        *) fail "empty commit prefix: message starts with the timestamp" "subject: $(git log -1 --format=%s)" ;;
+    esac
+    git -C "$MAIN" config faa.commitPrefix 'wip: '
+    printf 'v3\n' > feature.js; faa
+    case "$(git log -1 --format=%s)" in
+        "wip: "*) pass "custom commit prefix is used" ;;
+        *)        fail "custom commit prefix is used" "subject: $(git log -1 --format=%s)" ;;
+    esac
+
+    cd "$MAIN"; faa
+    assert_ok        "main pulls with a custom mirror prefix"
+    assert_curbranch "$MAIN" mir/add-button "mirror uses the configured prefix"
+    assert_file      "$MAIN" feature.js v3 "main sees the agent's work"
+    faa -h
+    assert_out "Mirror prefix: mir/" "help shows the configured prefix"
+
+    # A feature named like a mirror is refused under the new prefix.
+    git -C "$MAIN" branch mir/oops
+    faa -c mir/oops
+    assert_fails "feature branch with the mirror prefix is refused"
+
+    # Bad prefixes are rejected up front.
+    git -C "$MAIN" config faa.mirrorBranchPrefix ''
+    faa -l
+    assert_fails "empty mirror prefix is refused"
+    assert_out   "must not be empty" "explains the empty prefix"
+    git -C "$MAIN" config faa.mirrorBranchPrefix 'bad..'
+    faa -l
+    assert_fails "invalid mirror prefix is refused"
+
+    cleanup
+}
+
+# --------------------------------------------------------------------------
+journey_config
 journey_core_loop
 journey_main_tweaks_agent_file
 journey_push_guard
