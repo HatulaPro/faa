@@ -98,7 +98,7 @@ auto_msg() {
     local ts n files
     ts=$(date '+%Y-%m-%d %H:%M:%S')
     n=$(git diff --cached --name-only | wc -l | tr -d '[:space:]')
-    files=$(git diff --cached --name-only | head -5 | paste -sd ', ' -)
+    files=$(git diff --cached --name-only | head -5 | awk 'NR > 1 { printf ", " } { printf "%s", $0 }')
     [ "${n:-0}" -gt 5 ] && files="$files (+$((n - 5)) more)"
     printf 'faa: %s | %s file(s): %s' "$ts" "$n" "$files"
 }
