@@ -41,13 +41,26 @@ ref_sha()        { git rev-parse --verify --quiet "$1" 2>/dev/null; }
 is_ancestor()    { git merge-base --is-ancestor "$1" "$2" 2>/dev/null; }
 is_dirty()       { [ -n "$(git status --porcelain)" ]; }
 
-# True when run from the primary worktree ("main"). Both values are git-emitted
-# in the same format (verified stable on Git Bash), so no realpath needed.
+# Path of the primary worktree ("main"): git always lists it first, from any
+# worktree.
+main_path() { git worktree list --porcelain | sed -n 's/^worktree //p' | head -1; }
+
+# True when run from main. Both values are git-emitted in the same format
+# (verified stable on Git Bash), so no realpath needed.
 is_main() {
-    local top first
+    local top
     top=$(git rev-parse --show-toplevel 2>/dev/null) || return 1
-    first=$(git worktree list --porcelain | sed -n 's/^worktree //p' | head -1)
-    [ "$top" = "$first" ]
+    [ "$top" = "$(main_path)" ]
+}
+
+# main_path, checked to be a real working tree. A main made with
+# --separate-git-dir is reported as its git dir, which we can't work in.
+main_dir() {
+    local m
+    m=$(main_path)
+    [ -n "$m" ] && [ "$(git -C "$m" rev-parse --show-toplevel 2>/dev/null)" = "$m" ] \
+        || die "can't locate the main repo's working tree (git reports '$m')."
+    printf '%s' "$m"
 }
 
 # Feature branches that are checked out in *linked* worktrees (skip the primary
@@ -93,6 +106,15 @@ auto_msg() {
 commit_all() {
     git add -A
     git commit -q -m "$(auto_msg)" || die "commit failed"
+}
+
+# True when main has pushed commits that <feature> hasn't pulled yet.
+mirror_ahead() {
+    local feature="$1" mirror
+    mirror=$(mirror_of "$feature")
+    branch_exists "$mirror" \
+        && is_ancestor "refs/heads/$feature" "refs/heads/$mirror" \
+        && [ "$(ref_sha "refs/heads/$mirror")" != "$(ref_sha "refs/heads/$feature")" ]
 }
 
 set_reset_marker() {
@@ -194,6 +216,7 @@ main_pull() {
 }
 
 # Main: commit main's local tweaks onto the mirror so the agent can pull them.
+# Pass "quiet" to drop the "run 'faa' in the worktree" hint (faa both push).
 do_push() {
     is_main || die "'faa push' is for the main repo (in a worktree, just run 'faa')."
     local cur feature
@@ -206,7 +229,8 @@ do_push() {
     fi
     if ! is_dirty; then info "nothing to push."; return 0; fi
     commit_all
-    info "pushed $(short HEAD) on '$cur' — run 'faa' in the worktree to pull."
+    if [ "${1:-}" = quiet ]; then info "pushed $(short HEAD) on '$cur'."
+    else info "pushed $(short HEAD) on '$cur' — run 'faa' in the worktree to pull."; fi
 }
 
 # Bare `faa`: behavior depends on where it runs.
@@ -215,18 +239,63 @@ bare_faa() {
         main_pull
         return
     fi
-    local feature mirror
+    local feature
     feature=$(current_branch)
     [ -n "$feature" ] || die "detached HEAD — checkout your feature branch first."
     is_mirror "$feature" && die "feature branch '$feature' must not start with '$FAA_MIRROR_PREFIX'."
-    mirror=$(mirror_of "$feature")
-    if branch_exists "$mirror" \
-        && is_ancestor "refs/heads/$feature" "refs/heads/$mirror" \
-        && [ "$(ref_sha "refs/heads/$mirror")" != "$(ref_sha "refs/heads/$feature")" ]; then
+    if mirror_ahead "$feature"; then
         agent_pull          # mirror is ahead of B → pull main's push
     else
         agent_commit        # otherwise → save the agent's work
     fi
+}
+
+# `faa both` — do this side's step, then the other side's, so you don't have to
+# switch terminals. Each half is the ordinary command run in the other
+# worktree's directory, so its guards and messages are unchanged.
+do_both() {
+    case "${1:-}" in
+        '')   both_save ;;
+        push) both_push ;;
+        *)    die "unknown: faa both $1 (try 'faa both' or 'faa both push')." ;;
+    esac
+}
+
+# Worktree: `faa`, then `faa -c <this branch>` in main. Main follows *this*
+# branch, not the newest worktree. If `faa` pulled main's push instead of
+# saving, main already has those commits, so we stop there.
+both_save() {
+    is_main && die "'faa both' runs from a worktree (in main, 'faa both push' sends your tweaks to the agent)."
+    local feature main
+    feature=$(current_branch)
+    [ -n "$feature" ] || die "detached HEAD — checkout your feature branch first."
+    is_mirror "$feature" && die "feature branch '$feature' must not start with '$FAA_MIRROR_PREFIX'."
+    main=$(main_dir) || exit 1    # before touching anything, so a bad setup fails early
+    if mirror_ahead "$feature"; then
+        agent_pull
+        info "main already has these commits — run 'faa both' again to save your edits and send them to main."
+        return 0
+    fi
+    agent_commit
+    ( cd "$main" && checkout_feature "$feature" ) \
+        || die "saved on '$feature', but main's step failed (see above)."
+}
+
+# Main: `faa push`, then pull it into the worktree. The worktree is only touched
+# when it's clean: the agent may be writing there, and a conflict would leave
+# markers where you aren't looking.
+both_push() {
+    is_main || die "'faa both push' is for the main repo (in a worktree, use 'faa both')."
+    local feature wt
+    do_push quiet
+    feature=$(feature_of_mirror "$(current_branch)")
+    if ! mirror_ahead "$feature"; then info "worktree '$feature' is already up to date."; return 0; fi
+    wt=$(worktree_for_branch "$feature")
+    [ -n "$wt" ] || { info "no worktree has '$feature' checked out — nothing else to update."; return 0; }
+    [ -d "$wt" ] || die "worktree for '$feature' is missing at '$wt' (moved? try 'git worktree repair')."
+    ( cd "$wt" && ! is_dirty ) \
+        || die "worktree '$feature' has uncommitted changes, so it was left alone — run 'faa' there to pull."
+    ( cd "$wt" && agent_pull ) || exit 1
 }
 
 # `faa reset` — declare the current state as truth and record a marker for the
@@ -447,6 +516,10 @@ USAGE
                       pull that first (then run 'faa' again to save your edits).
                       In main: pull the latest work for the feature you verify.
   faa push            In main: commit your local tweaks so the agent can pull them.
+  faa both            In a worktree: 'faa' here, then 'faa -c <this branch>' in
+                      main — save and hand off in one step.
+  faa both push       In main: 'faa push', then pull it into the worktree (only
+                      if the worktree has no uncommitted changes).
   faa reset           Declare the current state as truth; tell the other side to sync.
   faa reset sync      Adopt the other side's latest reset (hard reset — discards
                       local changes on this side).
@@ -480,6 +553,7 @@ main() {
     case "${1:-}" in
         '')               bare_faa ;;
         push)             do_push ;;
+        both)             shift; do_both "$@" ;;
         loop)             shift; do_loop "$@" ;;
         reset)
             if [ "${2:-}" = "sync" ]; then do_reset_sync

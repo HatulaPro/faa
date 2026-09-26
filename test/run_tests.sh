@@ -467,6 +467,87 @@ journey_loop() {
 }
 
 # --------------------------------------------------------------------------
+# Journey 11 — `faa both`: do both sides' steps from one terminal.
+# --------------------------------------------------------------------------
+journey_both() {
+    echo "Journey 11: faa both"
+    setup; add_wt add-button
+    local BTN="$WT"; add_wt fix-nav; local NAV="$WT"
+
+    # The agent finishes; save it and hand it to main in one step.
+    cd "$BTN"
+    printf 'v1\n' > feature.js
+    faa both
+    assert_ok        "faa both saves and updates main"
+    assert_out       "committed" "the worktree commit is reported"
+    assert_curbranch "$MAIN" faa-add-button "main switched to this feature's mirror"
+    assert_file      "$MAIN" feature.js v1 "main sees the agent's work"
+
+    # Main follows *this* branch, even when another worktree is newer.
+    cd "$NAV"; printf 'nav\n' > nav.js
+    GIT_COMMITTER_DATE="2099-01-01T00:00:00" command faa >/dev/null 2>&1
+    cd "$BTN"; printf 'v2\n' > feature.js
+    faa both
+    assert_ok        "faa both with a newer worktree elsewhere"
+    assert_curbranch "$MAIN" faa-add-button "main stays on this feature, not the newest"
+    assert_file      "$MAIN" feature.js v2 "main pulled the new save"
+
+    # From main: push a fix and have the worktree pull it.
+    cd "$MAIN"
+    printf 'cfg\n' > config.js
+    faa both push
+    assert_ok   "faa both push pushes and updates the worktree"
+    assert_file "$BTN" config.js cfg "the worktree received main's fix"
+    assert_same "$MAIN" refs/heads/add-button refs/heads/faa-add-button "branches converged"
+
+    # Nothing to push and nothing pending: the worktree's edits are not committed.
+    printf 'wip\n' > "$BTN/wip.js"
+    local before; before=$(sha "$MAIN" refs/heads/add-button)
+    faa both push
+    assert_ok   "faa both push with nothing to push"
+    assert_out  "already up to date" "reports the worktree is current"
+    [ "$(sha "$MAIN" refs/heads/add-button)" = "$before" ] \
+        && pass "the agent's WIP was not committed" || fail "the agent's WIP was not committed"
+
+    # A dirty worktree is left alone, but main's push still lands.
+    printf 'cfg2\n' > config.js
+    faa both push
+    assert_fails "faa both push refuses to pull into a dirty worktree"
+    assert_out   "uncommitted changes" "says why"
+    assert_file  "$BTN" config.js cfg "the worktree was not touched"
+    assert_file  "$BTN" wip.js wip "the agent's WIP is intact"
+    assert_file  "$MAIN" config.js cfg2 "main's push was still committed"
+
+    # With main's push pending, `faa both` in the worktree just pulls it.
+    cd "$BTN"
+    faa both
+    assert_ok   "faa both pulls a pending push first"
+    assert_out  "run 'faa both' again" "asks to run again to save"
+    assert_file "$BTN" config.js cfg2 "the worktree received the pending push"
+    faa both
+    assert_ok   "second faa both saves and hands off"
+    assert_file "$MAIN" wip.js wip "main has the agent's edits"
+
+    # Main is dirty on another feature: the save lands, main refuses to switch.
+    cd "$MAIN"; faa -c fix-nav; printf 'tweak\n' > nav.js
+    cd "$BTN"; printf 'v3\n' > feature.js
+    faa both
+    assert_fails     "faa both reports main's failure"
+    assert_out       "main's step failed" "says the main step failed"
+    assert_curbranch "$MAIN" faa-fix-nav "main did not switch"
+    git -C "$BTN" diff --quiet HEAD && pass "the worktree save still happened" \
+        || fail "the worktree save still happened"
+
+    # Wrong side / unknown subcommand.
+    faa both push;  assert_fails "faa both push refuses in a worktree"
+    faa both nope;  assert_fails "unknown faa both subcommand refuses"
+    cd "$MAIN"
+    faa both;       assert_fails "faa both refuses in main"
+
+    cleanup
+}
+
+# --------------------------------------------------------------------------
 journey_core_loop
 journey_main_tweaks_agent_file
 journey_push_guard
@@ -477,6 +558,7 @@ journey_conflict
 journey_two_features
 journey_master_picks_latest
 journey_loop
+journey_both
 
 echo
 echo "-----------------------------------------"
